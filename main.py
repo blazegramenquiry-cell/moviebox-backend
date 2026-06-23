@@ -1,66 +1,54 @@
 import sys
 import importlib
 import inspect
-import pkgutil
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
-# ---------- Deep discovery of moviebox_api ----------
+# ---------- Import moviebox_api with session ----------
 MOVIEBOX_AVAILABLE = False
-client = None
+session = None
 
-def discover_client():
-    """Search all submodules of moviebox_api for a suitable client class."""
+# Import the package
+try:
+    package = importlib.import_module("moviebox_api")
+    print("✅ moviebox_api imported successfully")
+    
+    # Try to create a session
+    # The library likely uses httpx sessions internally
     try:
-        # Import the top-level package
-        package = importlib.import_module("moviebox_api")
-        print("✅ Top-level package 'moviebox_api' imported.")
-        print("📋 Top-level attributes:", [a for a in dir(package) if not a.startswith("_")])
+        import httpx
+        session = httpx.Client()
+        print("✅ HTTPX session created")
+        MOVIEBOX_AVAILABLE = True
+    except Exception as e:
+        print(f"⚠️ Could not create session: {e}")
+        
+except ImportError as e:
+    print(f"❌ Could not import moviebox_api: {e}")
 
-        # Walk all submodules
-        for importer, modname, ispkg in pkgutil.walk_packages(path=package.__path__, prefix="moviebox_api."):
-            try:
-                mod = importlib.import_module(modname)
-                print(f"🔍 Inspecting {modname}...")
-                # Find classes that are not built-in
-                for name, obj in inspect.getmembers(mod, inspect.isclass):
-                    if name.startswith("_"):
-                        continue
-                    if name in ("Exception", "BaseException", "object"):
-                        continue
-                    # Try to instantiate with no args
-                    try:
-                        instance = obj()
-                        # Check if it has common methods
-                        if any(hasattr(instance, m) for m in ["search", "get_info", "get_sources"]):
-                            print(f"✅ Found candidate: {modname}.{name}")
-                            return instance
-                        else:
-                            # Still, if it has no methods, skip
-                            continue
-                    except Exception as e:
-                        print(f"⚠️ Could not instantiate {modname}.{name}: {e}")
-            except ImportError as e:
-                print(f"⚠️ Could not import {modname}: {e}")
-            except Exception as e:
-                print(f"⚠️ Error in {modname}: {e}")
-        return None
-    except ImportError:
-        print("❌ Could not import moviebox_api at all.")
-        return None
+# Dictionary to cache imported classes
+classes = {}
 
-# Run discovery
-client = discover_client()
-if client:
-    MOVIEBOX_AVAILABLE = True
-    print("✅ Client successfully instantiated.")
-else:
-    print("❌ No suitable client found.")
+def get_class(module_path, class_name):
+    """Import and cache a class from moviebox_api."""
+    cache_key = f"{module_path}.{class_name}"
+    if cache_key in classes:
+        return classes[cache_key]
+    try:
+        mod = importlib.import_module(module_path)
+        if hasattr(mod, class_name):
+            cls = getattr(mod, class_name)
+            classes[cache_key] = cls
+            print(f"✅ Loaded {module_path}.{class_name}")
+            return cls
+    except Exception as e:
+        print(f"⚠️ Could not load {module_path}.{class_name}: {e}")
+    return None
 
 # ---------- FastAPI app ----------
-app = FastAPI(title="MovieBox API")
+app = FastAPI(title="MovieBox API", description="Backend for XiON Android app")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,66 +88,112 @@ class StreamResponse(BaseModel):
     subtitle_url: Optional[str] = None
     language: str = "en"
 
-# ---------- Helper: call method with fallback ----------
-def call_method(method_name, *args, **kwargs):
-    if client is None:
-        raise HTTPException(503, "Client not available")
-    alt_methods = {
-        "search": ["search", "get_search", "search_movies", "search_series"],
-        "get_info": ["get_info", "info", "get_details", "fetch_info"],
-        "get_sources": ["get_sources", "get_links", "get_stream", "get_episode"],
-        "trending": ["trending", "get_trending", "popular"],
-    }
-    for name in [method_name] + alt_methods.get(method_name, []):
-        if hasattr(client, name) and callable(getattr(client, name)):
-            try:
-                return getattr(client, name)(*args, **kwargs)
-            except Exception:
-                continue
-    raise HTTPException(500, f"No suitable method for {method_name}")
+# ---------- Helper: call with class ----------
+def call_with_class(module_path, class_name, method_name, *args, **kwargs):
+    """Instantiate a class with session and call a method."""
+    if not MOVIEBOX_AVAILABLE or session is None:
+        raise HTTPException(503, "Moviebox session not available")
+    cls = get_class(module_path, class_name)
+    if cls is None:
+        raise HTTPException(500, f"Class {class_name} not found in {module_path}")
+    try:
+        # Instantiate with session
+        instance = cls(session=session)
+        if hasattr(instance, method_name):
+            method = getattr(instance, method_name)
+            return method(*args, **kwargs)
+        else:
+            raise HTTPException(500, f"Method {method_name} not found in {class_name}")
+    except Exception as e:
+        raise HTTPException(500, f"Error in {class_name}.{method_name}: {str(e)}")
 
 # ---------- Endpoints ----------
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "message": "MovieBox API running",
+        "message": "MovieBox API is running",
         "moviebox_loaded": MOVIEBOX_AVAILABLE,
-        "client_type": str(type(client)) if client else None
+        "session_type": str(type(session)) if session else None
     }
 
 @app.get("/search", response_model=List[MediaItem])
 def search(query: str = Query(..., min_length=1)):
-    if not MOVIEBOX_AVAILABLE or client is None:
-        raise HTTPException(503, "Moviebox not loaded")
-    results = call_method("search", query)
-    items = []
-    for r in results:
-        items.append(MediaItem(
-            id=str(r.get("id") or r.get("movie_id")),
-            title=r.get("title") or r.get("name"),
-            year=r.get("year"),
-            poster=r.get("poster") or r.get("image"),
-            backdrop=r.get("backdrop"),
-            type="series" if r.get("is_series") else "movie"
-        ))
-    return items
+    if not MOVIEBOX_AVAILABLE or session is None:
+        raise HTTPException(503, "Moviebox session not available")
+    try:
+        # Try v1.Search class
+        cls = get_class("moviebox_api.v1", "Search")
+        if cls is None:
+            cls = get_class("moviebox_api.v1.core", "Search")
+        if cls is None:
+            raise HTTPException(500, "Search class not found")
+        
+        instance = cls(session=session, query=query)
+        results = instance.get_results()
+        
+        items = []
+        for r in results:
+            items.append(MediaItem(
+                id=str(r.get("subjectId") or r.get("id")),
+                title=r.get("title"),
+                year=r.get("releaseDate"),
+                poster=r.get("cover"),
+                backdrop=r.get("cover"),
+                type="series" if r.get("subjectType") == "tv" else "movie"
+            ))
+        return items
+    except Exception as e:
+        raise HTTPException(500, f"Search error: {str(e)}")
 
 @app.get("/info/{media_id}")
 def get_info(media_id: str):
-    if not MOVIEBOX_AVAILABLE or client is None:
-        raise HTTPException(503, "Moviebox not loaded")
-    info = call_method("get_info", media_id)
-    if not info.get("seasons"):
-        return {"id": media_id, "title": info.get("title"), "plot": info.get("overview"),
-                "poster": info.get("poster"), "backdrop": info.get("backdrop"), "type": "movie"}
-    seasons = []
-    for s in info.get("seasons", []):
-        eps = [Episode(episode=e.get("episode"), title=e.get("title"), thumbnail=e.get("thumbnail"))
-               for e in s.get("episodes", [])]
-        seasons.append(Season(season=s.get("season"), episodes=eps))
-    return SeriesInfo(id=media_id, title=info.get("title"), plot=info.get("overview"),
-                      poster=info.get("poster"), backdrop=info.get("backdrop"), seasons=seasons)
+    if not MOVIEBOX_AVAILABLE or session is None:
+        raise HTTPException(503, "Moviebox session not available")
+    try:
+        # Try v1.TVSeriesDetails or v1.MovieDetails
+        # First try TV series
+        tv_cls = get_class("moviebox_api.v1", "TVSeriesDetails")
+        if tv_cls is not None:
+            try:
+                instance = tv_cls(session=session, url_or_item=media_id)
+                info = instance.get_details()
+                seasons_list = []
+                for s in info.get("seasons", []):
+                    eps = [Episode(
+                        episode=e.get("episode"),
+                        title=e.get("title"),
+                        thumbnail=e.get("thumbnail")
+                    ) for e in s.get("episodes", [])]
+                    seasons_list.append(Season(season=s.get("season"), episodes=eps))
+                return SeriesInfo(
+                    id=media_id,
+                    title=info.get("title"),
+                    plot=info.get("description"),
+                    poster=info.get("cover"),
+                    backdrop=info.get("cover"),
+                    seasons=seasons_list
+                )
+            except:
+                pass  # Fall through to movie
+        
+        # Try movie
+        movie_cls = get_class("moviebox_api.v1", "MovieDetails")
+        if movie_cls is not None:
+            instance = movie_cls(session=session, url_or_item=media_id)
+            info = instance.get_details()
+            return {
+                "id": media_id,
+                "title": info.get("title"),
+                "plot": info.get("description"),
+                "poster": info.get("cover"),
+                "backdrop": info.get("cover"),
+                "type": "movie"
+            }
+        
+        raise HTTPException(500, "No info class found")
+    except Exception as e:
+        raise HTTPException(404, f"Info error: {str(e)}")
 
 @app.get("/stream/{media_id}")
 def get_stream(
@@ -168,35 +202,64 @@ def get_stream(
     episode: Optional[int] = None,
     lang: str = Query("en")
 ):
-    if not MOVIEBOX_AVAILABLE or client is None:
-        raise HTTPException(503, "Moviebox not loaded")
-    if season is not None and episode is not None:
-        sources = call_method("get_sources", media_id, season, episode, lang)
-    else:
-        sources = call_method("get_sources", media_id, lang=lang)
-    if not sources:
-        raise HTTPException(404, "No stream")
-    best = sources[0] if isinstance(sources, list) else sources
-    return StreamResponse(
-        url=best.get("url"),
-        quality=best.get("quality") or "720p",
-        subtitle_url=best.get("subtitle_url"),
-        language=lang
-    )
+    if not MOVIEBOX_AVAILABLE or session is None:
+        raise HTTPException(503, "Moviebox session not available")
+    try:
+        # Try to get downloadable files
+        if season is not None and episode is not None:
+            # TV series episode
+            cls = get_class("moviebox_api.v1.download", "DownloadableTVSeriesFilesDetail")
+            if cls is None:
+                raise HTTPException(500, "DownloadableTVSeriesFilesDetail not found")
+            instance = cls(session=session, item=media_id, season=season, episode=episode)
+            sources = instance.get_downloadable_files()
+        else:
+            # Movie
+            cls = get_class("moviebox_api.v1.download", "DownloadableMovieFilesDetail")
+            if cls is None:
+                raise HTTPException(500, "DownloadableMovieFilesDetail not found")
+            instance = cls(session=session, item=media_id)
+            sources = instance.get_downloadable_files()
+        
+        if not sources:
+            raise HTTPException(404, "No stream available")
+        
+        # Find the best quality or first source
+        best = sources[0] if isinstance(sources, list) else sources
+        url = best.get("url") or best.get("sniffUrl") or best.get("sourceUrl")
+        
+        return StreamResponse(
+            url=url,
+            quality=best.get("resolution") or best.get("quality") or "720p",
+            subtitle_url=best.get("subtitle_url"),
+            language=lang
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Stream error: {str(e)}")
 
 @app.get("/trending")
 def trending(limit: int = 20):
-    if not MOVIEBOX_AVAILABLE or client is None:
-        raise HTTPException(503, "Moviebox not loaded")
-    results = call_method("trending", limit=limit)
-    if not isinstance(results, list):
-        results = results.get("results", []) if isinstance(results, dict) else []
-    items = []
-    for r in results:
-        items.append(MediaItem(
-            id=str(r.get("id")),
-            title=r.get("title"),
-            poster=r.get("poster"),
-            type="series" if r.get("type") == "series" else "movie"
-        ))
-    return items
+    if not MOVIEBOX_AVAILABLE or session is None:
+        raise HTTPException(503, "Moviebox session not available")
+    try:
+        # Use v1.Trending class
+        cls = get_class("moviebox_api.v1", "Trending")
+        if cls is None:
+            cls = get_class("moviebox_api.v1.core", "Trending")
+        if cls is None:
+            raise HTTPException(500, "Trending class not found")
+        
+        instance = cls(session=session)
+        results = instance.get_content()
+        
+        items = []
+        for r in results:
+            items.append(MediaItem(
+                id=str(r.get("subjectId") or r.get("id")),
+                title=r.get("title"),
+                poster=r.get("cover"),
+                type="series" if r.get("subjectType") == "tv" else "movie"
+            ))
+        return items
+    except Exception as e:
+        raise HTTPException(500, f"Trending error: {str(e)}")
