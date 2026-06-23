@@ -1,3 +1,6 @@
 fastapi
 uvicorn
+httpx
+beautifulsoup4
+socksio
 git+https://github.com/blazegramenquiry-cell/moviebox-api.git@main
