@@ -1,4 +1,5 @@
 import asyncio
+import json
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -57,45 +58,100 @@ class StreamResponse(BaseModel):
     subtitle_url: Optional[str] = None
     language: str = "en"
 
-# ---------- Helper: Get or create session ----------
+# ---------- Helper: Get session ----------
 async def get_session():
     global session
     if session is None and MOVIEBOX_AVAILABLE:
         session = Session()
-        # Fetch app info to initialize cookies
         try:
             await session.get_moviebox_app_info()
-            print("✅ Session initialized with cookies")
+            print("✅ Session initialized")
         except Exception as e:
             print(f"⚠️ Session init warning: {e}")
     return session
 
+# ---------- Helper: Call method with fallback ----------
+def call_method(obj, method_names, *args, **kwargs):
+    """Try multiple method names until one works."""
+    for name in method_names:
+        if hasattr(obj, name) and callable(getattr(obj, name)):
+            try:
+                return getattr(obj, name)(*args, **kwargs)
+            except Exception:
+                continue
+    raise AttributeError(f"No suitable method found among {method_names} in {obj}")
+
+# ---------- Helper: Get search results ----------
+async def get_search_results(query):
+    sess = await get_session()
+    if sess is None:
+        raise Exception("No session")
+    search_obj = Search(session=sess, query=query)
+    result = call_method(search_obj, ["get_results", "search", "get", "fetch", "results", "get_content"])
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result
+
+# ---------- Helper: Get trending ----------
+async def get_trending_results():
+    sess = await get_session()
+    if sess is None:
+        raise Exception("No session")
+    trending_obj = Trending(session=sess)
+    result = call_method(trending_obj, ["get_content", "get", "fetch", "content", "results"])
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result
+
+# ---------- Helper: Get info ----------
+async def get_info_data(media_id):
+    sess = await get_session()
+    if sess is None:
+        raise Exception("No session")
+    # Try TV series first
+    try:
+        tv_obj = TVSeriesDetails(session=sess, url_or_item=media_id)
+        info = call_method(tv_obj, ["get_details", "details", "get", "fetch"])
+        if isinstance(info, str):
+            info = json.loads(info)
+        return info, "tv"
+    except:
+        pass
+    # Fall back to movie
+    movie_obj = MovieDetails(session=sess, url_or_item=media_id)
+    info = call_method(movie_obj, ["get_details", "details", "get", "fetch"])
+    if isinstance(info, str):
+        info = json.loads(info)
+    return info, "movie"
+
+# ---------- Helper: Get stream ----------
+async def get_stream_data(media_id, season=None, episode=None):
+    sess = await get_session()
+    if sess is None:
+        raise Exception("No session")
+    if season is not None and episode is not None:
+        obj = DownloadableTVSeriesFilesDetail(session=sess, item=media_id, season=season, episode=episode)
+    else:
+        obj = DownloadableMovieFilesDetail(session=sess, item=media_id)
+    sources = call_method(obj, ["get_downloadable_files", "get_sources", "get_links", "fetch"])
+    if isinstance(sources, str):
+        sources = json.loads(sources)
+    return sources
+
 # ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {
-        "status": "ok",
-        "message": "MovieBox API is running",
-        "moviebox_loaded": MOVIEBOX_AVAILABLE
-    }
+    return {"status": "ok", "moviebox_loaded": MOVIEBOX_AVAILABLE}
 
 @app.get("/search", response_model=List[MediaItem])
-async def search(query: str = Query(..., min_length=1, description="Search term")):
-    """
-    Search for movies or TV series.
-    Example: /search?query=naruto
-    """
+async def search(query: str = Query(..., min_length=1)):
     if not MOVIEBOX_AVAILABLE:
         raise HTTPException(503, "Moviebox library not loaded")
-    
-    sess = await get_session()
-    if sess is None:
-        raise HTTPException(503, "Could not create session")
-    
     try:
-        search_obj = Search(session=sess, query=query)
-        results = await search_obj.get_results()
-        
+        results = await get_search_results(query)
+        if not isinstance(results, list):
+            if isinstance(results, dict):
+                results = results.get("items") or results.get("results") or [results]
         items = []
         for r in results:
             items.append(MediaItem(
@@ -112,22 +168,11 @@ async def search(query: str = Query(..., min_length=1, description="Search term"
 
 @app.get("/info/{media_id}")
 async def get_info(media_id: str):
-    """
-    Get detailed info for a movie or TV series.
-    Example: /info/12345
-    """
     if not MOVIEBOX_AVAILABLE:
         raise HTTPException(503, "Moviebox library not loaded")
-    
-    sess = await get_session()
-    if sess is None:
-        raise HTTPException(503, "Could not create session")
-    
     try:
-        # Try TV series first
-        try:
-            tv = TVSeriesDetails(session=sess, url_or_item=media_id)
-            info = await tv.get_details()
+        info, typ = await get_info_data(media_id)
+        if typ == "tv":
             seasons_list = []
             for s in info.get("seasons", []):
                 eps = [Episode(
@@ -144,10 +189,7 @@ async def get_info(media_id: str):
                 backdrop=info.get("cover"),
                 seasons=seasons_list
             )
-        except Exception:
-            # Fall back to movie
-            movie = MovieDetails(session=sess, url_or_item=media_id)
-            info = await movie.get_details()
+        else:
             return {
                 "id": media_id,
                 "title": info.get("title"),
@@ -166,42 +208,14 @@ async def get_stream(
     episode: Optional[int] = None,
     lang: str = Query("en")
 ):
-    """
-    Get streaming URL for a movie or TV episode.
-    For movies: /stream/12345
-    For TV: /stream/12345?season=1&episode=3&lang=en
-    """
     if not MOVIEBOX_AVAILABLE:
         raise HTTPException(503, "Moviebox library not loaded")
-    
-    sess = await get_session()
-    if sess is None:
-        raise HTTPException(503, "Could not create session")
-    
     try:
-        if season is not None and episode is not None:
-            # TV series episode
-            dl = DownloadableTVSeriesFilesDetail(
-                session=sess,
-                item=media_id,
-                season=season,
-                episode=episode
-            )
-            sources = await dl.get_downloadable_files()
-        else:
-            # Movie
-            dl = DownloadableMovieFilesDetail(
-                session=sess,
-                item=media_id
-            )
-            sources = await dl.get_downloadable_files()
-        
+        sources = await get_stream_data(media_id, season, episode)
         if not sources:
             raise HTTPException(404, "No stream available")
-        
         best = sources[0] if isinstance(sources, list) else sources
         url = best.get("url") or best.get("sniffUrl") or best.get("sourceUrl")
-        
         return StreamResponse(
             url=url,
             quality=best.get("resolution") or best.get("quality") or "720p",
@@ -213,21 +227,13 @@ async def get_stream(
 
 @app.get("/trending")
 async def trending(limit: int = 20):
-    """
-    Get trending movies and TV series.
-    Example: /trending?limit=20
-    """
     if not MOVIEBOX_AVAILABLE:
         raise HTTPException(503, "Moviebox library not loaded")
-    
-    sess = await get_session()
-    if sess is None:
-        raise HTTPException(503, "Could not create session")
-    
     try:
-        trending_obj = Trending(session=sess)
-        results = await trending_obj.get_content()
-        
+        results = await get_trending_results()
+        if not isinstance(results, list):
+            if isinstance(results, dict):
+                results = results.get("subjectList") or results.get("items") or results.get("results") or [results]
         items = []
         for r in results:
             items.append(MediaItem(
