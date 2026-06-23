@@ -1,3 +1,4 @@
 fastapi
 uvicorn
 moviebox-api
+python-dotenv
