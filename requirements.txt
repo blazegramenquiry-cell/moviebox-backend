@@ -5,4 +5,5 @@ beautifulsoup4
 socksio
 click
 rich
+throttlebuster
 git+https://github.com/blazegramenquiry-cell/moviebox-api.git@main
