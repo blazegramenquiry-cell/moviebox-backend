@@ -1,37 +1,40 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
 import sys
+import subprocess
+import pkgutil
+import importlib
 
-# ---------- Try multiple possible import names ----------
+# ---------- DEBUG: List installed packages ----------
+print("📦 Installed packages:")
+for module in pkgutil.iter_modules():
+    print(f"  - {module.name}")
+
+# ---------- Attempt to import moviebox ----------
 MOVIEBOX_AVAILABLE = False
 MovieboxClass = None
 
-possible_imports = [
-    ("moviebox", "Moviebox"),
-    ("moviebox_api", "Moviebox"),
-    ("moviebox", "Client"),
-    ("moviebox_api", "Client"),
-    ("moviebox", "MovieBox"),
-]
+try:
+    # Try to import the module by any name we can think of
+    for name in ["moviebox", "moviebox_api", "moviebox"]:
+        try:
+            mod = importlib.import_module(name)
+            # Try to find a class named Moviebox, Client, etc.
+            for class_name in ["Moviebox", "Client", "MovieBox"]:
+                if hasattr(mod, class_name):
+                    MovieboxClass = getattr(mod, class_name)
+                    MOVIEBOX_AVAILABLE = True
+                    print(f"✅ Found {name}.{class_name}")
+                    break
+            if MOVIEBOX_AVAILABLE:
+                break
+        except ImportError:
+            continue
 
-for mod_name, class_name in possible_imports:
-    try:
-        mod = __import__(mod_name, fromlist=[class_name])
-        MovieboxClass = getattr(mod, class_name)
-        MOVIEBOX_AVAILABLE = True
-        print(f"✅ Imported {mod_name}.{class_name} successfully")
-        break
-    except (ImportError, AttributeError):
-        continue
-
-if not MOVIEBOX_AVAILABLE:
-    print("❌ Could not import moviebox library. Check the installation logs.")
+except Exception as e:
+    print(f"❌ Import error: {e}")
 
 # ---------- Initialize client ----------
 client = None
-if MOVIEBOX_AVAILABLE:
+if MOVIEBOX_AVAILABLE and MovieboxClass:
     try:
         client = MovieboxClass()
         print("✅ Moviebox client initialized")
@@ -39,7 +42,12 @@ if MOVIEBOX_AVAILABLE:
         print(f"❌ Client init error: {e}")
         MOVIEBOX_AVAILABLE = False
 
-# ---------- FastAPI app ----------
+# ---------- FastAPI app (unchanged) ----------
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List
+
 app = FastAPI(title="MovieBox API")
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +56,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- Response models (same as before) ----------
+# ---------- Models ----------
 class MediaItem(BaseModel):
     id: str
     title: str
@@ -138,7 +146,6 @@ def get_stream(
     if not MOVIEBOX_AVAILABLE or client is None:
         raise HTTPException(503, "Moviebox not loaded")
     try:
-        # Try different method names
         sources = None
         if hasattr(client, "get_sources"):
             sources = client.get_sources(media_id, season=season, episode=episode, lang=lang)
@@ -147,7 +154,7 @@ def get_stream(
         elif hasattr(client, "get_stream"):
             sources = client.get_stream(media_id, season=season, episode=episode, lang=lang)
         else:
-            sources = client.get_sources(media_id, season, episode, lang)  # fallback
+            sources = client.get_sources(media_id, season, episode, lang)
         if not sources:
             raise HTTPException(404, "No stream available")
         best = sources[0]
