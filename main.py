@@ -2,16 +2,18 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import logging
 
-# ---------- Import from moviebox-api v2 ----------
+# ---------- Correct Imports from moviebox-api v2 ----------
+MOVIEBOX_AVAILABLE = False
+
 try:
-    from moviebox_api.v2 import Client
+    from moviebox_api.v2.requests import Session
+    from moviebox_api.v2.core import Search, MovieDetails, TVSeriesDetails, ItemDetails
+    from moviebox_api.v2.download import DownloadableSingleFilesDetail, DownloadableTVSeriesFilesDetail
     MOVIEBOX_AVAILABLE = True
     print("✅ moviebox_api.v2 imported successfully")
 except ImportError as e:
-    print(f"❌ Could not import moviebox_api.v2: {e}")
-    MOVIEBOX_AVAILABLE = False
+    print(f"❌ Import failed: {e}")
 
 app = FastAPI(title="MovieBox API", description="Backend for XiON Android app")
 
@@ -35,16 +37,17 @@ class StreamResponse(BaseModel):
     quality: Optional[str] = None
     subtitle_url: Optional[str] = None
 
-# ---------- Global Client ----------
-client = None
+# ---------- Global Session ----------
+session = None
 
-async def get_client():
-    global client
-    if client is None and MOVIEBOX_AVAILABLE:
-        client = Client()  # This is the recommended way
-    return client
+async def get_session():
+    global session
+    if session is None and MOVIEBOX_AVAILABLE:
+        session = Session()
+        await session.ensure_cookies_are_assigned()
+    return session
 
-# ---------- Endpoints ----------
+# ---------- Routes ----------
 @app.get("/")
 async def root():
     return {
@@ -53,60 +56,66 @@ async def root():
         "moviebox_loaded": MOVIEBOX_AVAILABLE
     }
 
-@app.get("/search", response_model=List[MediaItem])
+@app.get("/search")
 async def search(query: str = Query(..., min_length=1)):
     if not MOVIEBOX_AVAILABLE:
-        raise HTTPException(503, "Moviebox library not available")
+        raise HTTPException(503, "Moviebox library not loaded")
     
-    cl = await get_client()
+    sess = await get_session()
     try:
-        results = await cl.search(query, page=1, per_page=20)
+        search_obj = Search(session=sess, query=query, subject_type=0, page=1, per_page=20)
+        results = await search_obj.get_content_model()
         
         items = []
-        for item in results.get("items", []):
+        for item in results.items:
+            d = item.model_dump() if hasattr(item, "model_dump") else item.dict()
             items.append(MediaItem(
-                id=str(item.get("subjectId")),
-                title=item.get("title"),
-                year=item.get("releaseDate"),
-                poster=item.get("cover"),
-                type="series" if item.get("subjectType") == 2 else "movie"
+                id=str(d.get("subjectId")),
+                title=d.get("title"),
+                year=d.get("releaseDate"),
+                poster=d.get("cover"),
+                type="series" if d.get("subjectType") == 2 else "movie"
             ))
         return items
     except Exception as e:
-        raise HTTPException(500, f"Search failed: {str(e)}")
+        raise HTTPException(500, f"Search error: {str(e)}")
 
 @app.get("/info/{media_id}")
 async def get_info(media_id: str):
     if not MOVIEBOX_AVAILABLE:
-        raise HTTPException(503, "Moviebox library not available")
+        raise HTTPException(503, "Moviebox library not loaded")
     
-    cl = await get_client()
+    sess = await get_session()
     try:
-        details = await cl.get_details(media_id)
-        return details
+        # Try as movie first, fallback to series
+        try:
+            details = await MovieDetails(url_or_item=media_id, session=sess).get_content_model()
+            return details.subject.model_dump()
+        except:
+            details = await TVSeriesDetails(url_or_item=media_id, session=sess).get_content_model()
+            return details.subject.model_dump()
     except Exception as e:
         raise HTTPException(404, f"Item not found: {str(e)}")
 
 @app.get("/stream/{media_id}")
-async def get_stream(
-    media_id: str,
-    season: Optional[int] = None,
-    episode: Optional[int] = None
-):
+async def get_stream(media_id: str, season: Optional[int] = None, episode: Optional[int] = None):
     if not MOVIEBOX_AVAILABLE:
-        raise HTTPException(503, "Moviebox library not available")
+        raise HTTPException(503, "Moviebox library not loaded")
     
-    cl = await get_client()
+    sess = await get_session()
     try:
-        if season and episode:
-            stream = await cl.get_series_stream(media_id, season, episode)
+        if season is not None and episode is not None:
+            dl = DownloadableTVSeriesFilesDetail(session=sess, item=media_id)
+            files = await dl.get_content_model(season=season, episode=episode)
         else:
-            stream = await cl.get_movie_stream(media_id)
+            dl = DownloadableSingleFilesDetail(session=sess, item=media_id)
+            files = await dl.get_content_model()
         
+        best = files.best_media_file
         return StreamResponse(
-            url=stream.get("url"),
-            quality=stream.get("quality"),
-            subtitle_url=stream.get("subtitle_url")
+            url=str(best.url),
+            quality=f"{best.resolution}P",
+            subtitle_url=str(files.english_subtitle_file.url) if files.english_subtitle_file else None
         )
     except Exception as e:
         raise HTTPException(500, f"Stream error: {str(e)}")
