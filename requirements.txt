@@ -1,9 +1,4 @@
-fastapi
-uvicorn
-httpx
-beautifulsoup4
-socksio
-click
-rich
-throttlebuster
-git+https://github.com/blazegramenquiry-cell/moviebox-api.git@main
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+moviebox-api[cli]>=0.5.4
+pydantic>=2.8.0
