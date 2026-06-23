@@ -1,54 +1,23 @@
-import sys
-import importlib
-import inspect
+import asyncio
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 
-# ---------- Import moviebox_api with session ----------
+# ---------- Import moviebox_api ----------
 MOVIEBOX_AVAILABLE = False
 session = None
 
-# Import the package
 try:
-    package = importlib.import_module("moviebox_api")
-    print("✅ moviebox_api imported successfully")
-    
-    # Try to create a session
-    # The library likely uses httpx sessions internally
-    try:
-        import httpx
-        session = httpx.Client()
-        print("✅ HTTPX session created")
-        MOVIEBOX_AVAILABLE = True
-    except Exception as e:
-        print(f"⚠️ Could not create session: {e}")
-        
+    from moviebox_api.v1 import Session, Search, Trending, MovieDetails, TVSeriesDetails
+    from moviebox_api.v1.download import DownloadableMovieFilesDetail, DownloadableTVSeriesFilesDetail
+    MOVIEBOX_AVAILABLE = True
+    print("✅ moviebox_api.v1 imported successfully")
 except ImportError as e:
     print(f"❌ Could not import moviebox_api: {e}")
 
-# Dictionary to cache imported classes
-classes = {}
-
-def get_class(module_path, class_name):
-    """Import and cache a class from moviebox_api."""
-    cache_key = f"{module_path}.{class_name}"
-    if cache_key in classes:
-        return classes[cache_key]
-    try:
-        mod = importlib.import_module(module_path)
-        if hasattr(mod, class_name):
-            cls = getattr(mod, class_name)
-            classes[cache_key] = cls
-            print(f"✅ Loaded {module_path}.{class_name}")
-            return cls
-    except Exception as e:
-        print(f"⚠️ Could not load {module_path}.{class_name}: {e}")
-    return None
-
 # ---------- FastAPI app ----------
-app = FastAPI(title="MovieBox API", description="Backend for XiON Android app")
+app = FastAPI(title="MovieBox API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -88,24 +57,18 @@ class StreamResponse(BaseModel):
     subtitle_url: Optional[str] = None
     language: str = "en"
 
-# ---------- Helper: call with class ----------
-def call_with_class(module_path, class_name, method_name, *args, **kwargs):
-    """Instantiate a class with session and call a method."""
-    if not MOVIEBOX_AVAILABLE or session is None:
-        raise HTTPException(503, "Moviebox session not available")
-    cls = get_class(module_path, class_name)
-    if cls is None:
-        raise HTTPException(500, f"Class {class_name} not found in {module_path}")
-    try:
-        # Instantiate with session
-        instance = cls(session=session)
-        if hasattr(instance, method_name):
-            method = getattr(instance, method_name)
-            return method(*args, **kwargs)
-        else:
-            raise HTTPException(500, f"Method {method_name} not found in {class_name}")
-    except Exception as e:
-        raise HTTPException(500, f"Error in {class_name}.{method_name}: {str(e)}")
+# ---------- Helper: Get or create session ----------
+async def get_session():
+    global session
+    if session is None and MOVIEBOX_AVAILABLE:
+        session = Session()
+        # Fetch app info to initialize cookies
+        try:
+            await session.get_moviebox_app_info()
+            print("✅ Session initialized with cookies")
+        except Exception as e:
+            print(f"⚠️ Session init warning: {e}")
+    return session
 
 # ---------- Endpoints ----------
 @app.get("/")
@@ -113,24 +76,25 @@ def root():
     return {
         "status": "ok",
         "message": "MovieBox API is running",
-        "moviebox_loaded": MOVIEBOX_AVAILABLE,
-        "session_type": str(type(session)) if session else None
+        "moviebox_loaded": MOVIEBOX_AVAILABLE
     }
 
 @app.get("/search", response_model=List[MediaItem])
-def search(query: str = Query(..., min_length=1)):
-    if not MOVIEBOX_AVAILABLE or session is None:
-        raise HTTPException(503, "Moviebox session not available")
+async def search(query: str = Query(..., min_length=1, description="Search term")):
+    """
+    Search for movies or TV series.
+    Example: /search?query=naruto
+    """
+    if not MOVIEBOX_AVAILABLE:
+        raise HTTPException(503, "Moviebox library not loaded")
+    
+    sess = await get_session()
+    if sess is None:
+        raise HTTPException(503, "Could not create session")
+    
     try:
-        # Try v1.Search class
-        cls = get_class("moviebox_api.v1", "Search")
-        if cls is None:
-            cls = get_class("moviebox_api.v1.core", "Search")
-        if cls is None:
-            raise HTTPException(500, "Search class not found")
-        
-        instance = cls(session=session, query=query)
-        results = instance.get_results()
+        search_obj = Search(session=sess, query=query)
+        results = await search_obj.get_results()
         
         items = []
         for r in results:
@@ -147,41 +111,43 @@ def search(query: str = Query(..., min_length=1)):
         raise HTTPException(500, f"Search error: {str(e)}")
 
 @app.get("/info/{media_id}")
-def get_info(media_id: str):
-    if not MOVIEBOX_AVAILABLE or session is None:
-        raise HTTPException(503, "Moviebox session not available")
+async def get_info(media_id: str):
+    """
+    Get detailed info for a movie or TV series.
+    Example: /info/12345
+    """
+    if not MOVIEBOX_AVAILABLE:
+        raise HTTPException(503, "Moviebox library not loaded")
+    
+    sess = await get_session()
+    if sess is None:
+        raise HTTPException(503, "Could not create session")
+    
     try:
-        # Try v1.TVSeriesDetails or v1.MovieDetails
-        # First try TV series
-        tv_cls = get_class("moviebox_api.v1", "TVSeriesDetails")
-        if tv_cls is not None:
-            try:
-                instance = tv_cls(session=session, url_or_item=media_id)
-                info = instance.get_details()
-                seasons_list = []
-                for s in info.get("seasons", []):
-                    eps = [Episode(
-                        episode=e.get("episode"),
-                        title=e.get("title"),
-                        thumbnail=e.get("thumbnail")
-                    ) for e in s.get("episodes", [])]
-                    seasons_list.append(Season(season=s.get("season"), episodes=eps))
-                return SeriesInfo(
-                    id=media_id,
-                    title=info.get("title"),
-                    plot=info.get("description"),
-                    poster=info.get("cover"),
-                    backdrop=info.get("cover"),
-                    seasons=seasons_list
-                )
-            except:
-                pass  # Fall through to movie
-        
-        # Try movie
-        movie_cls = get_class("moviebox_api.v1", "MovieDetails")
-        if movie_cls is not None:
-            instance = movie_cls(session=session, url_or_item=media_id)
-            info = instance.get_details()
+        # Try TV series first
+        try:
+            tv = TVSeriesDetails(session=sess, url_or_item=media_id)
+            info = await tv.get_details()
+            seasons_list = []
+            for s in info.get("seasons", []):
+                eps = [Episode(
+                    episode=e.get("episode"),
+                    title=e.get("title"),
+                    thumbnail=e.get("thumbnail")
+                ) for e in s.get("episodes", [])]
+                seasons_list.append(Season(season=s.get("season"), episodes=eps))
+            return SeriesInfo(
+                id=media_id,
+                title=info.get("title"),
+                plot=info.get("description"),
+                poster=info.get("cover"),
+                backdrop=info.get("cover"),
+                seasons=seasons_list
+            )
+        except Exception:
+            # Fall back to movie
+            movie = MovieDetails(session=sess, url_or_item=media_id)
+            info = await movie.get_details()
             return {
                 "id": media_id,
                 "title": info.get("title"),
@@ -190,41 +156,49 @@ def get_info(media_id: str):
                 "backdrop": info.get("cover"),
                 "type": "movie"
             }
-        
-        raise HTTPException(500, "No info class found")
     except Exception as e:
         raise HTTPException(404, f"Info error: {str(e)}")
 
 @app.get("/stream/{media_id}")
-def get_stream(
+async def get_stream(
     media_id: str,
     season: Optional[int] = None,
     episode: Optional[int] = None,
     lang: str = Query("en")
 ):
-    if not MOVIEBOX_AVAILABLE or session is None:
-        raise HTTPException(503, "Moviebox session not available")
+    """
+    Get streaming URL for a movie or TV episode.
+    For movies: /stream/12345
+    For TV: /stream/12345?season=1&episode=3&lang=en
+    """
+    if not MOVIEBOX_AVAILABLE:
+        raise HTTPException(503, "Moviebox library not loaded")
+    
+    sess = await get_session()
+    if sess is None:
+        raise HTTPException(503, "Could not create session")
+    
     try:
-        # Try to get downloadable files
         if season is not None and episode is not None:
             # TV series episode
-            cls = get_class("moviebox_api.v1.download", "DownloadableTVSeriesFilesDetail")
-            if cls is None:
-                raise HTTPException(500, "DownloadableTVSeriesFilesDetail not found")
-            instance = cls(session=session, item=media_id, season=season, episode=episode)
-            sources = instance.get_downloadable_files()
+            dl = DownloadableTVSeriesFilesDetail(
+                session=sess,
+                item=media_id,
+                season=season,
+                episode=episode
+            )
+            sources = await dl.get_downloadable_files()
         else:
             # Movie
-            cls = get_class("moviebox_api.v1.download", "DownloadableMovieFilesDetail")
-            if cls is None:
-                raise HTTPException(500, "DownloadableMovieFilesDetail not found")
-            instance = cls(session=session, item=media_id)
-            sources = instance.get_downloadable_files()
+            dl = DownloadableMovieFilesDetail(
+                session=sess,
+                item=media_id
+            )
+            sources = await dl.get_downloadable_files()
         
         if not sources:
             raise HTTPException(404, "No stream available")
         
-        # Find the best quality or first source
         best = sources[0] if isinstance(sources, list) else sources
         url = best.get("url") or best.get("sniffUrl") or best.get("sourceUrl")
         
@@ -238,19 +212,21 @@ def get_stream(
         raise HTTPException(500, f"Stream error: {str(e)}")
 
 @app.get("/trending")
-def trending(limit: int = 20):
-    if not MOVIEBOX_AVAILABLE or session is None:
-        raise HTTPException(503, "Moviebox session not available")
+async def trending(limit: int = 20):
+    """
+    Get trending movies and TV series.
+    Example: /trending?limit=20
+    """
+    if not MOVIEBOX_AVAILABLE:
+        raise HTTPException(503, "Moviebox library not loaded")
+    
+    sess = await get_session()
+    if sess is None:
+        raise HTTPException(503, "Could not create session")
+    
     try:
-        # Use v1.Trending class
-        cls = get_class("moviebox_api.v1", "Trending")
-        if cls is None:
-            cls = get_class("moviebox_api.v1.core", "Trending")
-        if cls is None:
-            raise HTTPException(500, "Trending class not found")
-        
-        instance = cls(session=session)
-        results = instance.get_content()
+        trending_obj = Trending(session=sess)
+        results = await trending_obj.get_content()
         
         items = []
         for r in results:
