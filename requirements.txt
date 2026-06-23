@@ -3,4 +3,6 @@ uvicorn
 httpx
 beautifulsoup4
 socksio
+click
+rich
 git+https://github.com/blazegramenquiry-cell/moviebox-api.git@main
