@@ -1,4 +1,3 @@
 fastapi
 uvicorn
 git+https://github.com/blazegramenquiry-cell/moviebox-api.git
-python-dotenv
